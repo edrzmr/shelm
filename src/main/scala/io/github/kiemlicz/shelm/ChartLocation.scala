@@ -227,7 +227,10 @@ case class ChartMappings(
   chartUpdate: Chart => Chart = identity,
   includeFiles: Seq[(File, String)] = Seq.empty,
   yamlsToMerge: Seq[(File, String)] = Seq.empty,
-  valueOverrides: Option[Json] => Seq[Json] = _ => Seq.empty,
+  valueOverrides: Option[Json] => Seq[Json] = {
+    case None => Seq.empty
+    case Some(json) => Seq(json)
+  },
   dependencyUpdate: Boolean = true,
   lintSettings: LintSettings = LintSettings()
 )

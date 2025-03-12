@@ -42,6 +42,7 @@ object HelmPlugin extends AutoPlugin {
     lazy val chartSettings = settingKey[Seq[ChartSettings]]("All per-Chart settings")
     lazy val downloadedChartsCache = settingKey[File]("Directory to search for charts, before downloading them")
     lazy val chartMuseumClient = settingKey[ChartMuseumClient]("Chart Museum client, supply e.g. if different thread pool is to be used")
+    lazy val valuesMappings = settingKey[Seq[(String, Json)]]("lepo")
 
     lazy val cleanChartsCache = taskKey[Unit]("Cleans charts cache")
     lazy val helmVersion = taskKey[VersionNumber]("Local Helm binary version")
@@ -69,6 +70,7 @@ object HelmPlugin extends AutoPlugin {
       shouldUpdateRepositories := false,
       downloadedChartsCache := new File("helm-cache"),
       chartSettings := Seq.empty[ChartSettings],
+      valuesMappings := Seq.empty[(String, Json)],
       helmVersion := {
         val cmd = "helm version --template {{.Version}}"
         startProcess(cmd) match {
@@ -132,6 +134,7 @@ object HelmPlugin extends AutoPlugin {
         val mappings = chartMappings.value //must be outside of lambda
         val settings = chartSettings.value
         settings.map(mappings).zipWithIndex.map { case (mappings, idx) =>
+
           val tempChartDir = ChartDownloader.download(
             mappings.settings.chartLocation,
             target.value / s"${mappings.settings.chartLocation.chartName.name}-$idx",
@@ -174,10 +177,19 @@ object HelmPlugin extends AutoPlugin {
               }
             } else IO.copyFile(overrides, dst)
           }
+
           val valuesFile = tempChartDir / ValuesYaml
-          val valuesJson = if (valuesFile.exists()) yaml.parser.parse(new FileReader(valuesFile)).toOption else None
-          val overrides = mergeOverrides(mappings.valueOverrides(valuesJson))
-          overrides.foreach { valuesOverride =>
+          val valuesJson: Option[Json] = if (valuesFile.exists()) yaml.parser.parse(new FileReader(valuesFile)).toOption else None
+          val overrides: Option[Json] = mergeOverrides(mappings.valueOverrides(valuesJson))
+          val valuesMapped: Option[Json] = overrides.map(json => valuesMapper(json, valuesMappings.value)(log))
+
+          log.info(s"valueMappings: ${valuesMappings.value}")
+          log.info(s">>>>>>>>>>>>>> valueFile: $valuesFile")
+          log.info(s">>>>>>>>>>>>>> valueJson: $valuesJson")
+          log.info(s">>>>>>>>>>>>>> overrides: $overrides")
+          log.info(s">>>>>>>>>>>>>> mapped: $valuesMapped")
+
+          valuesMapped.foreach { valuesOverride =>
             IO.write(
               valuesFile,
               if (valuesFile.exists())
@@ -189,6 +201,7 @@ object HelmPlugin extends AutoPlugin {
               else yaml.printer.print(valuesOverride),
             )
           }
+
           IO.write(tempChartDir / ChartYaml, yaml.printer.print(updatedChartYaml.asJson))
           cleanFiles ++= Seq(tempChartDir) //todo is it thread safe? After all this can be run concurrently
           (tempChartDir, mappings)
@@ -222,16 +235,16 @@ object HelmPlugin extends AutoPlugin {
   import autoImport.*
 
   /**
-    * OCI registry only
-    * Login to OCI registry
-    * Happens only during setupRegistries
-    * Will auto-enable on publish task
-    */
+   * OCI registry only
+   * Login to OCI registry
+   * Happens only during setupRegistries
+   * Will auto-enable on publish task
+   */
   private[this] def loginRepo(
-    registry: OciChartRegistry,
-    helmVersion: VersionNumber,
-    log: Logger,
-  ): Unit = {
+                               registry: OciChartRegistry,
+                               helmVersion: VersionNumber,
+                               log: Logger,
+                             ): Unit = {
     helmVersion match {
       case VersionNumber(Seq(major, minor, _@_*), _, _) if major >= 3 && minor >= 8 =>
       case _ => sys.error(s"Cannot login to OCI registry (Helm must be at least in 3.8.0 version): $helmVersion")
@@ -249,10 +262,10 @@ object HelmPlugin extends AutoPlugin {
   }
 
   /**
-    * `helm repo add`
-    * Doesn't work for OCI
-    * https://github.com/helm/helm/issues/10565
-    */
+   * `helm repo add`
+   * Doesn't work for OCI
+   * https://github.com/helm/helm/issues/10565
+   */
   private[this] def ensureRepo(repo: Repository, log: Logger): Unit = {
     log.info(s"Adding Legacy $repo to Helm Repositories")
     val options = chartRepositoryCommandFlags(repo.auth())
@@ -325,12 +338,12 @@ object HelmPlugin extends AutoPlugin {
   }
 
   private[this] def buildChart(
-    chartDir: File,
-    chartName: ChartName,
-    chartVersion: String,
-    targetDir: File,
-    log: Logger,
-  ): File = {
+                                chartDir: File,
+                                chartName: ChartName,
+                                chartVersion: String,
+                                targetDir: File,
+                                log: Logger,
+                              ): File = {
     val dest = s" -d $targetDir"
     val cmd = s"helm package$dest $chartDir"
     val output = targetDir / s"${chartName.name}-$chartVersion.tgz"
@@ -340,12 +353,12 @@ object HelmPlugin extends AutoPlugin {
   }
 
   /**
-    * Retry given command
-    * That method exists only due to: https://github.com/helm/helm/issues/2258
-    *
-    * @param cmd shell command that will potentially be retried
-    * @param n   number of tries
-    */
+   * Retry given command
+   * That method exists only due to: https://github.com/helm/helm/issues/2258
+   *
+   * @param cmd shell command that will potentially be retried
+   * @param n   number of tries
+   */
   private[shelm] def retrying(cmd: String, sbtLogger: Logger, n: Int = 3): Unit = {
     val initialSleep = FiniteDuration(1, SECONDS)
     val backOff = 2
@@ -386,6 +399,30 @@ object HelmPlugin extends AutoPlugin {
     val merged = overrides.foldLeft(Json.Null)(_.deepMerge(_))
     if (overrides.isEmpty) None else Some(merged)
   }
+
+  private[this] def valuesMapper(json: Json, entries: Seq[(String, Json)])(sbtLogger: Logger): Json = {
+
+    def updatePath(json: Json, path: String)(f: Json => Json): Option[Json] =
+      (path.split('.').toList match {
+        case x :: Nil => Some(json.hcursor.downField(x))
+        case x :: xs => Some(xs.foldLeft(json.hcursor.downField(x)) { case (cursor, field) => cursor.downField(field) })
+        case _ => None
+      }).flatMap(cursor => cursor.withFocus(f).top)
+
+    entries.foldLeft((List.empty[String], json)) {
+      case ((errors, json), (path, value)) =>
+        updatePath(json, path) { _ => value } match {
+          case None => (path :: errors) -> json
+          case Some(json) =>
+            sbtLogger.info(s"path: $path, json value: $value")
+            errors -> json
+        }
+    } match {
+      case (Nil, json) => json
+      case (errors, _) => throw new HelmChartOverrideException(errors.reverse)
+    }
+  }
+
 
   private[shelm] def chartRepositoryCommandFlags(settings: ChartRepositoryAuth): String = settings match {
     case NoAuth => ""
@@ -522,32 +559,32 @@ object HelmPublishPlugin extends AutoPlugin {
   )
 
   private def withArtifacts[T <: ChartHosting](
-    pc: PublishConfiguration,
-    packaged: Map[Artifact, File],
-    registries: Seq[ChartHosting]
-  )(implicit ct: ClassTag[T]): PublishConfiguration = {
+                                                pc: PublishConfiguration,
+                                                packaged: Map[Artifact, File],
+                                                registries: Seq[ChartHosting]
+                                              )(implicit ct: ClassTag[T]): PublishConfiguration = {
     if (registries.exists(_.getClass == ct.runtimeClass))
       pc.withArtifacts(packaged.toVector)
     else pc
   }
 
   /**
-    *
-    * @param registryUri URI prefixed with `oci://` scheme
-    */
+   *
+   * @param registryUri URI prefixed with `oci://` scheme
+   */
   private[shelm] def pushChart(
-    chartLocation: File, registryUri: URI, log: Logger
-  ): Either[Throwable, Unit] = {
+                                chartLocation: File, registryUri: URI, log: Logger
+                              ): Either[Throwable, Unit] = {
     val cmd = s"helm push $chartLocation $registryUri"
     log.info(s"Publishing Helm Chart: $cmd")
     throwableToLeft(HelmPlugin.retrying(cmd, log, n = 1))
   }
 
   private[this] def addPackage(
-    helmPackageTask: TaskKey[Seq[PackagedChartInfo]],
-    extension: String,
-    classifier: Option[String] = None,
-  ): Seq[Setting[_]] =
+                                helmPackageTask: TaskKey[Seq[PackagedChartInfo]],
+                                extension: String,
+                                classifier: Option[String] = None,
+                              ): Seq[Setting[_]] =
     Seq(
       artifacts ++= chartSettings.value.map { s =>
         Artifact( // incomplete since the exact version is unknown
@@ -579,9 +616,9 @@ object HelmPublishPlugin extends AutoPlugin {
     )
 
   /**
-    * Saves scoped `publishTo` (`Helm / publishTo)` into `otherResolvers`
-    * This way only scoped publishTo is required to be set
-    */
+   * Saves scoped `publishTo` (`Helm / publishTo)` into `otherResolvers`
+   * This way only scoped publishTo is required to be set
+   */
   private[this] def addResolver(config: Configuration): Seq[Setting[_]] =
     Seq(otherResolvers ++= (config / publishTo).value.toSeq)
 

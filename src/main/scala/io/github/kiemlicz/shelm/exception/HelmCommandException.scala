@@ -19,3 +19,6 @@ class HelmRegistryLoginException(output: ProcessOutput, exitCode: Int, registry:
   extends RuntimeException(
     s"Registry: $registry login failed with exit code: $exitCode, ensure login data exists or provide the correct credentials,\noutput: ${output.entireOutput}"
   )
+
+class HelmChartOverrideException(paths: Seq[String])
+  extends RuntimeException(s"Could not override paths:\n${paths.mkString("\n")}")

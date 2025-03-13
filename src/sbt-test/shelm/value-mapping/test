@@ -1,0 +1,20 @@
+> set scriptedBufferLog := false
+
+# ensure clean state
+> clean
+
+# check if the file gets created
+> Helm / packagesBin
+#$ exists target/overrides-chart-3.2.3+meta.data.tgz
+#$ exists target/overrides-chart-0/overrides-chart/values.yaml
+#$ exists target/overrides-chart-0/overrides-chart/Chart.yaml
+#$ exists target/overrides-chart-0/overrides-chart/templates/service.yaml
+
+$ pause
+
+> assertGeneratedValues
+$ pause
+
+#> clean
+#$ absent target/overrides-chart-3.2.3+meta.data.tgz
+#$ absent target/overrides-chart-0
